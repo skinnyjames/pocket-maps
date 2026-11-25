@@ -1,3 +1,4 @@
 src/map/layers/downloads/
 downloads/
 bin/
+.DS_Store

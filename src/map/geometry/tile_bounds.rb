@@ -21,6 +21,20 @@ module HackOS
       collection(zoom).offset
     end
 
+    # LatLng -> screen pixel. lat_lng_to_point returns tile units at the
+    # URL zoom (zoom + zoom_offset), and the view center sits at
+    # screen_bounds.center + drag_offset, so it's just a shift and a scale.
+    def lat_lng_to_screen(latlng, zoom)
+      p = crs.lat_lng_to_point(latlng, zoom)
+      tile_point_to_screen(p, zoom)
+    end
+
+    def tile_point_to_screen(p, zoom)
+      c = crs.lat_lng_to_point(center, zoom)
+      sc = screen_bounds.center + drag_offset
+      Point.new(sc.x + (p.x - c.x) * TILE_SIZE, sc.y + (p.y - c.y) * TILE_SIZE)
+    end
+
     def coords_at(point, zoom)
       collection = collection(zoom)
       tile = collection.contains(point)

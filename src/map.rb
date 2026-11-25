@@ -1,10 +1,16 @@
-
+require_relative "./map/ai/cgi"
+require_relative "./map/ai/fake_gps"
+require_relative "./map/ai/route_progress"
 require_relative "./map/error"
 require_relative "./map/geo"
-require_relative "./map/layers"
 require_relative "./map/geometry"
+require_relative "./map/layers"
+require_relative "./map/ai/routing"
 require_relative "./map/control"
 require_relative "./config"
+require_relative "./map/controls/search"
+require_relative "./map/controls/zoom"
+require_relative "./map/controls/banner"
 
 module HackOS
   class Map < Hokusai::Block
@@ -16,69 +22,21 @@ module HackOS
 
     uses(vblock: Hokusai::Blocks::Vblock)
 
-    attr_reader :size
-    attr_accessor :sdrag
-  
-    provide :zoom, :zoom
-    provide :center, :center
-    provide :container_size, :size
-    provide :tile_bounds, :tile_bounds
-
-    computed! :center
-    computed :crs, default: "EPSG3857"
-    computed :zoom, default: 1
-    computed :min_zoom, default: nil
-    computed :max_zoom, default: nil
-    computed :update_center, default: nil
+    inject :control
 
     def before_updated
-      if update_center
-        @bounds = TileBounds.new(HackOS::EPSG3857, update_center, size)
-        emit("clear_update_center")
-      end
-    end
-
-    def start_drag(event)
-              p event.pos.x, event.pos.y
-
-      if event.left.down && !@started
-        self.sdrag = [event.pos.x.clone, event.pos.y.clone]
-        @started = true
+      if control.center_changed
+        control.update_bounds!
+        control.center_changed = false
       end
     end
 
     def on_resize(canvas)
-      @size = Bounds.new([canvas.x, canvas.y], [canvas.x + canvas.width, canvas.y + canvas.height])
-      @bounds = TileBounds.new(HackOS::EPSG3857, center, size)
-    end
-
-    def center_point
-      HackOS::EPSG3857.lat_lng_to_point(center, zoom)
-    end
-
-    def alert_latlng(event)
-      if sdrag && ((event.pos.x - sdrag[0]).abs > 5 || (event.pos.y - sdrag[1]).abs > 5)
-        @started = false
-        self.sdrag = nil
-        return
-      end
-    
-      if event.left.released
-        point = Point.new(event.pos.x, event.pos.y)
-        clicked = Point.new(event.pos.x, event.pos.y)
-        emit("change", tile_bounds.coords_at(point, zoom), clicked)
-        @started = false
-      end
-    end
-
-    def tile_bounds
-      @bounds ||= TileBounds.new(HackOS::EPSG3857, center, size)
+      control.resize canvas
     end
 
     def render(canvas)
-      if @size.nil?
-        on_resize(canvas)
-      end
+      on_resize(canvas) if control.bounds_size.nil?
 
       yield canvas
     end
@@ -97,25 +55,22 @@ class App < Hokusai::Block
       height: 100.0;
       padding: padding(20.0, 0.0, 30.0, 0.0);
     }
-
-    input {
-      background: rgb(255,255,255);
-      color: rgb(22,22,22);
-      padding: padding(5.0, 15.0, 5.0, 15.0);
-      outline: outline(1.0, 1.0, 1.0, 1.0)
-      outline_color: rgb(33,33,33);
-      height: 50.0;
-      rounding: 0.2;
-    }
-
     label {
       color: rgb(255,255,255);
     }
-
     zstyle {
       z: 2;
       ztarget: "parent";
       reverse: true;
+    }
+    currentLocation {
+      height: 30.0;
+      background: rgb(22, 22, 22);
+      padding: padding(5.0, 5.0, 5.0, 5.0);
+    }
+    currentLocationText {
+      size: 20;
+      color: rgb(255,255,255);
     }
   EOF
 
@@ -127,149 +82,149 @@ class App < Hokusai::Block
         @clear_update_center="clear_update_center"
         :update_center="update_center"
         cursor="pointer"
-        :center="center"
-        :zoom="zoom"
+        :center="control.center"
+        :zoom="control.zoom"
       }
-        tile_layer {
-          ...tileStyle 
-        }
-        marker_layer {:marker="marker"}
+        tile_layer { ...tileStyle }
+        [if="route"]
+          geojson_layer { :data="route" }
+      arrival { :height="120.0" }
+      [if="current_address"]
+        vblock { ...currentLocation :height="current_address_height" }
+          text { :content="current_address" ...currentLocationText @height_updated="set_current_address_height" }
     hblock { ...zstyle }
-      control { 
-        @zoomin="zoom_in"
-        @zoomout="zoom_out"
-        :height="80.0" :width="65.0"
-      }
-      empty
-      vblock { padding="10.0,0.0,0.0,10.0"}
-        input { @mousedown="stop" model="foo" @change="search" ...input }
+      [if="driving"]
+        banner
+      [else]
+        search
   EOF
 
   uses(
+    arrival: HackOS::ArrivalBar,
+    banner: HackOS::Banner,
+    dynamic: Hokusai::Blocks::Dynamic,
+    text: Hokusai::Blocks::Text,
+    search: HackOS::Controls::Search,
+    zoom: HackOS::Controls::Zoom,
+    icon: Hokusai::Blocks::Icon,
+    selectable: Hokusai::Blocks::Selectable,
     hblock: Hokusai::Blocks::Hblock,
     vblock: Hokusai::Blocks::Vblock,
     label: Hokusai::Blocks::Label,
     input: Hokusai::Blocks::Input,
     empty: Hokusai::Blocks::Empty,
-    control: HackOS::Control,
     button: Hokusai::Blocks::Button,
     map: HackOS::Map,
     tile_layer: HackOS::TileLayer,
+    geojson_layer: HackOS::Maps::GeoJSONLayer,
     marker_layer: HackOS::MarkerLayer
   )
 
   attr_reader :drag_offset, :update_center
-
-  def on_mounted
-    p ["mount"]
-  end
-
-  def stop(event)
-    event.stop
-  end
-
-  def point
-    @point || "no point"
-  end
+  attr_reader :control, :current_address_height
+  provide :control, :control
 
   def initialize(**args)
+    @control = HackOS::Control.new(HackOS::LatLng.new(39.9612, -82.9988))
+    @current_address_height = 30.0 + 10.0
     super
-
-    @dragging = false
   end
 
-  def marker
-    @marker
+  def driving
+    !control.progress_geojson.nil?
   end
 
-  def search(term)
-    begin
-      fetch("https://geoffrey.skinnyjames.net/api/v1/us/geocode/#{CGI.escapeURIComponent(term)}", { "method" => "GET"}) do |res|
-        body = res.body.json
-        p body
-        @update_center = HackOS::LatLng.new(res["latitude"], res["longitude"])
-        @marker = HackOS::Point.new(400, 400)
+  def set_current_address_height(height)
+    @current_address_height = height + 10.0
+  end
+
+  def route
+    control.progress_geojson
+  end
+
+  def current_address
+    control.errors[:current] || control.search_from
+  end
+
+  def announce(info, speed)
+    m = info[:next_maneuver]
+    d = info[:to_next_m]
+    return unless m && d
+
+    key = m["begin_shape_index"]
+    secs = speed > 1 ? d / speed : Float::INFINITY
+
+    # just finished a turn: say what comes next
+    cur = info[:maneuver]
+    if cur && !@announced[[cur["begin_shape_index"], :post]]
+      @announced[[cur["begin_shape_index"], :post]] = true
+      say(cur["verbal_post_transition_instruction"])
+    end
+
+    # heads-up
+    if secs < 30 && !@announced[[key, :alert]]
+      @announced[[key, :alert]] = true
+      say(m["verbal_transition_alert_instruction"])
+    end
+
+    # right before the turn; short version if we're nearly there
+    if secs < 8 && !@announced[[key, :now]]
+      @announced[[key, :now]] = true
+      say(secs < 4 ? m["verbal_succinct_transition_instruction"] : m["verbal_pre_transition_instruction"])
+
+      # "Then ..." already covered the next turn
+      if m["verbal_multi_cue"]
+        idx = @progress.maneuvers.index(m)
+        following = idx && @progress.maneuvers[idx + 1]
+        @announced[[following["begin_shape_index"], :alert]] = true if following
       end
     end
   end
 
-  def update_latlng(latlng, point)
-    p["changing"]
-    @marker = point.clone
-    add = latlng.reverse_geo
-    @point = <<~EOF
-    #{latlng}
-    #{add[:address_number]} #{add[:street_name]} #{add[:street_posttype]}
-    #{add[:postal_community]}, #{add[:state]} #{add[:zip_code]}
-    EOF
-  end
-  
-  def clear_update_center
-    @update_center = nil
+  def target_zoom(info, speed)
+    base = speed > 22 ? 5 : (speed > 13 ? 8 : 10)   # highway / arterial / city
+    d = info[:to_next_m] || Float::INFINITY
+
+    if d < 120
+      @zoomed_in = true
+    elsif d > 250
+      @zoomed_in = false
+    end
+
+    @zoomed_in ? [base + 1, 9].min : base
   end
 
-  def zoom_out
-    @marker = nil
-    @zoom -= 1
+  def say(text)
+    Hokusai.speak(text) if text && !text.empty?
   end
 
-  def zoom
-    @zoom ||= 1
-  end
-
-  def center
-    @center ||= HackOS::LatLng.new(39.9612, -82.9988)
-  end
-
-  def zoom_in
-    @marker = nil
-
-    @zoom += 1
+  def render(canvas)
+    @announced ||= {}
+    control.canvas = canvas
+    if info = control.progress      
+      control.center = info[:snapped]
+      control.update_progress(info)
+      announce(info, 43)
+    end
+    yield canvas
   end
 end
 
+require_relative "./icon"
 
 Hokusai::Backend.run(App) do |config|
-  config.title = "Hokusai Paint"
+  config.title = "Hokusai Maps"
   config.fps = 60
-  config.width = 1400
+  config.width = 500
   config.height = 800
-  # config.draw_fps = true
-  # config.config_flags = HP_FLAG_WINDOW_RESIZABLE
-  # config.log = true
-  config.audio = false
+  config.event_waiting = false
+  config.audio = true
+  config.speech = true
 
   config.after_load do
-    Hokusai.fonts.register "inter", Hokusai::Backend::Font.from(TrollioConfig.asset("Inter-Regular.ttf"))
+    Hokusai.fonts.register "inter", Hokusai::Backend::Font.from_ext(TrollioConfig.asset("Inter-Regular.ttf"), 44)
     Hokusai.fonts.activate "inter"
+
+    Hokusai.fonts.register "icons", Hokusai::Backend::Font.from_ext("assets/material.ttf", 34 * 4, Hokusai::Blocks::Icon::MAP.values.join(""))
   end
 end
-
-
-# Hokusai::Backend.run(App) do |config|
-#   config.title = "Trollio Maps"
-#   config.width = 800
-#   config.height = 800
-
-#   config.after_load do
-#     Hokusai.fonts.register "inter", Hokusai::Backend::Font.from(TrollioConfig.asset("Inter-Regular.ttf"))
-#     Hokusai.fonts.activate "inter"
-#     Hokusai.maximize_window
-#   end
-# end
-
-
-#
-# 1 = 9
-# 2 = 10
-# 3 = 11
-#
-#
-
-# latlng = HackOS::LatLng.new(39.9612, -82.9988)
-# point = HackOS::EPSG3857.lat_lng_to_point(latlng, 4)
-# new_lat_lng = HackOS::EPSG3857.point_to_lat_lng(point, 4)
-
-# map = HackOS::EPSG3857
-
-# pmap.projection.project(map.projection.unproject(HackOS::Point.new(0, 0)))
